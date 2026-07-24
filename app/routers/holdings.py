@@ -16,12 +16,13 @@ def _list_holdings(user, db):
     rows = db.query(models.Holding).filter(models.Holding.user_id == user.id).all()
     out = []
     for h in rows:
-        price, indicator, reason = bridge.holding_indicator(h.ticker)
+        row = bridge.holding_row(h.ticker)
+        price = row["price"]
         pnl = round((price - h.avg_price) / h.avg_price * 100, 2) if (price and h.avg_price) else None
         out.append({
             "ticker": h.ticker, "shares": h.shares, "avg_price": round(h.avg_price, 2),
-            "current_price": price, "pnl_pct": pnl,
-            "indicator": indicator, "reason": reason,
+            "current_price": price, "pnl_pct": pnl, "change_pct": row["change_pct"],
+            "indicator": row["indicator"], "reason": row["reason"],
         })
     return {"holdings": out}
 

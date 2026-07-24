@@ -188,3 +188,51 @@ def safe_quote(ticker: str) -> dict:
         return get_quote(ticker)
     except Exception as exc:  # noqa: BLE001
         return {"ticker": ticker, "price": None, "change_pct": None, "error": type(exc).__name__}
+
+
+def holding_row(ticker: str) -> dict:
+    """Price, today's change %, and SELL/HOLD indicator for a held stock."""
+    q = safe_quote(ticker)
+    try:
+        m = _data.get_latest_summary(ticker)
+        if m["rsi"] > 65 and m["macd"] < m["signal"]:
+            indicator, reason = "SELL", "Overbought with bearish MACD — consider taking profit."
+        else:
+            indicator, reason = "HOLD", "No exit signal — position looks fine."
+    except Exception:
+        indicator, reason = "HOLD", "Data unavailable."
+    return {"price": q.get("price"), "change_pct": q.get("change_pct"),
+            "indicator": indicator, "reason": reason}
+
+
+def chat(message: str, history: list, holdings_ctx: list, watchlist: list) -> str:
+    """Answer a user's free-form question grounded in THEIR portfolio data.
+    Stateless: all context is passed in per call, so users never mix."""
+    if holdings_ctx:
+        hold_lines = "\n".join(
+            f"- {h['ticker']}: {h['shares']} shares, bought at ${h['avg_price']}, "
+            f"now ${h.get('price','?')} ({h.get('pnl_pct','?')}% P/L, {h.get('change_pct','?')}% today)"
+            for h in holdings_ctx
+        )
+    else:
+        hold_lines = "(the user owns no stocks yet)"
+
+    wl = ", ".join(watchlist) if watchlist else "(empty)"
+
+    convo = ""
+    for turn in history[-10:]:  # cap history to control token size
+        role = "User" if turn.get("role") == "user" else "Assistant"
+        convo += f"{role}: {turn.get('content','')}\n"
+
+    prompt = (
+        "You are a helpful assistant inside a stock-trading simulation app.\n"
+        "Use ONLY the portfolio data provided below. Do not invent prices or figures. "
+        "If asked about something not in the data, say you don't have that information. "
+        "Keep answers concise and practical. This is a simulation, not financial advice.\n\n"
+        f"USER'S HOLDINGS:\n{hold_lines}\n\n"
+        f"USER'S WATCHLIST: {wl}\n\n"
+        f"{'CONVERSATION SO FAR:\n' + convo + '\n' if convo else ''}"
+        f"User: {message}\n"
+        "Assistant:"
+    )
+    return _agent.llm_client.query(prompt)
