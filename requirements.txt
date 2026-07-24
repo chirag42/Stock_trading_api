@@ -1,0 +1,11 @@
+# Backend API. Run in the SAME venv as your trading repo (which supplies
+# yfinance, transformers, torch, ollama, anthropic).
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+
+# Phase 2 — database + auth
+sqlalchemy==2.0.35
+bcrypt==4.2.0
+pyjwt==2.9.0
+email-validator==2.2.0
