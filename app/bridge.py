@@ -4,7 +4,9 @@ Adds the trading repo to sys.path, builds heavy singletons once, and exposes
 small functions the routers call (market data, news, analysis, holdings analysis).
 """
 
+import json
 import logging
+import os
 import sys
 
 from app.config import LLM_BACKEND, TRADING_REPO_PATH
@@ -188,3 +190,166 @@ def safe_quote(ticker: str) -> dict:
         return get_quote(ticker)
     except Exception as exc:  # noqa: BLE001
         return {"ticker": ticker, "price": None, "change_pct": None, "error": type(exc).__name__}
+
+
+def holding_row(ticker: str) -> dict:
+    """Price, today's change %, and SELL/HOLD indicator for a held stock."""
+    q = safe_quote(ticker)
+    try:
+        m = _data.get_latest_summary(ticker)
+        if m["rsi"] > 65 and m["macd"] < m["signal"]:
+            indicator, reason = "SELL", "Overbought with bearish MACD — consider taking profit."
+        else:
+            indicator, reason = "HOLD", "No exit signal — position looks fine."
+    except Exception:
+        indicator, reason = "HOLD", "Data unavailable."
+    return {"price": q.get("price"), "change_pct": q.get("change_pct"),
+            "indicator": indicator, "reason": reason}
+
+
+def chat(message: str, history: list, holdings_ctx: list, watchlist: list) -> str:
+    """Answer a user's free-form question grounded in THEIR portfolio data.
+    Stateless: all context is passed in per call, so users never mix."""
+    if holdings_ctx:
+        hold_lines = "\n".join(
+            f"- {h['ticker']}: {h['shares']} shares, bought at ${h['avg_price']}, "
+            f"now ${h.get('price','?')} ({h.get('pnl_pct','?')}% P/L, {h.get('change_pct','?')}% today)"
+            for h in holdings_ctx
+        )
+    else:
+        hold_lines = "(the user owns no stocks yet)"
+
+    wl = ", ".join(watchlist) if watchlist else "(empty)"
+
+    convo = ""
+    for turn in history[-10:]:  # cap history to control token size
+        role = "User" if turn.get("role") == "user" else "Assistant"
+        convo += f"{role}: {turn.get('content','')}\n"
+
+    prompt = (
+        "You are a helpful assistant inside a stock-trading simulation app.\n"
+        "Use ONLY the portfolio data provided below. Do not invent prices or figures. "
+        "If asked about something not in the data, say you don't have that information. "
+        "Keep answers concise and practical. This is a simulation, not financial advice.\n\n"
+        f"USER'S HOLDINGS:\n{hold_lines}\n\n"
+        f"USER'S WATCHLIST: {wl}\n\n"
+        f"{'CONVERSATION SO FAR:\n' + convo + '\n' if convo else ''}"
+        f"User: {message}\n"
+        "Assistant:"
+    )
+    return _agent.llm_client.query(prompt)
+
+
+# ── Agentic chat: tool definitions + tool-use loop ────────────────
+import anthropic as _anthropic_sdk
+
+_anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+_anthropic_client = _anthropic_sdk.Anthropic(api_key=_anthropic_key) if _anthropic_key else None
+
+CHAT_TOOLS = [
+    {
+        "name": "get_stock_data",
+        "description": ("Get current price, day change, RSI, MACD, and news sentiment for "
+                        "ANY stock ticker — including ones the user does NOT own. Use this for "
+                        "questions about a stock's current state, recent movement, or forward "
+                        "outlook, and to check whether a ticker is valid."),
+        "input_schema": {"type": "object",
+                         "properties": {"ticker": {"type": "string", "description": "Stock ticker symbol, e.g. AAPL"}},
+                         "required": ["ticker"]},
+    },
+    {
+        "name": "get_my_holdings",
+        "description": ("Get the user's CURRENT stock holdings: shares owned and average cost per "
+                        "stock. Use for questions about what the user currently owns."),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_my_transactions",
+        "description": ("Get the user's buy/sell transaction HISTORY, optionally filtered by ticker. "
+                        "Use for questions like 'when did I buy X', 'how many times did I buy X', or "
+                        "'show my trade history'."),
+        "input_schema": {"type": "object",
+                         "properties": {"ticker": {"type": "string", "description": "Optional ticker to filter by"}}},
+    },
+    {
+        "name": "get_my_watchlist",
+        "description": "Get the tickers on the user's watchlist. Use for questions about what they are watching.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+]
+
+CHAT_SYSTEM = (
+    "You are a portfolio assistant inside a stock-trading SIMULATION app.\n"
+    "- Use the tools to fetch real data. NEVER invent prices, numbers, dates, or holdings.\n"
+    "- For a stock's current state or outlook, or to validate a ticker, call get_stock_data.\n"
+    "- For 'when/how many times did I buy or sell', call get_my_transactions.\n"
+    "- For what the user owns now, call get_my_holdings; for their watchlist, get_my_watchlist.\n"
+    "- If a ticker is invalid, say so plainly.\n"
+    "- Be concise. This is a simulation, not financial advice. Frame any forward-looking view as "
+    "scenarios and uncertainty, never as a definite prediction.\n"
+    "Format every answer for readability:\n"
+    "- Lead with a one-sentence direct answer.\n"
+    "- Use a Markdown table when presenting holdings, transactions, or multiple stocks.\n"
+    "- Use short bullet points for lists of facts.\n"
+    "- Bold the key number or decision.\n"
+    "- Keep it concise — no long paragraphs."
+    
+)
+
+
+def tool_stock_data(ticker: str) -> dict:
+    """Tool body for get_stock_data — validates and fetches live context for any ticker."""
+    ticker = (ticker or "").upper().strip()
+    if not ticker:
+        return {"error": "no ticker provided"}
+    try:
+        q = get_quote(ticker)  # raises if invalid
+    except Exception:
+        return {"error": f"'{ticker}' is not a valid ticker or has no market data."}
+    out = {"ticker": ticker, "price": q["price"], "day_change_pct": q["change_pct"]}
+    try:
+        m = _data.get_latest_summary(ticker)
+        out.update({"rsi": round(float(m["rsi"]), 1), "rsi_signal": m.get("rsi_signal", ""),
+                    "macd": round(float(m["macd"]), 3), "macd_signal": m.get("macd_signal", "")})
+    except Exception:
+        out["indicators"] = "unavailable"
+    try:
+        s = _sentiment.get_aggregated_sentiment(ticker)
+        out.update({"sentiment": s["overall"], "positive_articles": s["positive"],
+                    "negative_articles": s["negative"]})
+    except Exception:
+        out["sentiment"] = "unavailable"
+    return out
+
+
+def run_agentic_chat(message: str, history: list, handlers: dict, max_iters: int = 5) -> str:
+    """Runs the Claude tool-use loop. `handlers` maps tool name -> callable (user-scoped)."""
+    if _anthropic_client is None:
+        return "Chat requires the Claude backend — set ANTHROPIC_API_KEY on the server."
+
+    messages = [{"role": t["role"], "content": t["content"]} for t in history[-10:]]
+    messages.append({"role": "user", "content": message})
+
+    for _ in range(max_iters):
+        resp = _anthropic_client.messages.create(
+            model="claude-sonnet-4-6", max_tokens=1024,
+            system=CHAT_SYSTEM, tools=CHAT_TOOLS, messages=messages,
+        )
+        if resp.stop_reason == "tool_use":
+            messages.append({"role": "assistant", "content": resp.content})
+            results = []
+            for block in resp.content:
+                if getattr(block, "type", None) == "tool_use":
+                    fn = handlers.get(block.name)
+                    try:
+                        data = fn(**block.input) if fn else {"error": "unknown tool"}
+                    except Exception as exc:  # noqa: BLE001
+                        data = {"error": str(exc)}
+                    results.append({"type": "tool_result", "tool_use_id": block.id,
+                                    "content": json.dumps(data)})
+            messages.append({"role": "user", "content": results})
+            continue
+        # Final answer
+        return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
+
+    return "I could not complete that request in time — please try rephrasing."

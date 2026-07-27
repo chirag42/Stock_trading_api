@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import CORS_ORIGINS, LLM_BACKEND, TICKERS
 from app.database import init_db
-from app.routers import auth, market, watchlist, holdings
+from app.routers import auth, market, watchlist, holdings, chat
 
 logging.basicConfig(level=logging.INFO)
 
@@ -31,3 +31,4 @@ app.include_router(auth.router)
 app.include_router(market.router)
 app.include_router(watchlist.router)
 app.include_router(holdings.router)
+app.include_router(chat.router)

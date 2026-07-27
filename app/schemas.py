@@ -96,6 +96,7 @@ class HoldingItem(BaseModel):
     avg_price: float
     current_price: Optional[float] = None
     pnl_pct: Optional[float] = None
+    change_pct: Optional[float] = None   # today's move vs prev close
     indicator: str                 # SELL or HOLD (owned)
     reason: str
 
@@ -120,3 +121,18 @@ class SummaryResponse(BaseModel):
     rsi_signal: str
     macd: float
     macd_signal: str
+
+
+# ── Chat (Sprint 6) ───────────────────────────────────────────────
+class ChatMessage(BaseModel):
+    role: str          # "user" or "assistant"
+    content: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+    history: List[ChatMessage] = []
+
+
+class ChatResponse(BaseModel):
+    answer: str

@@ -16,12 +16,13 @@ def _list_holdings(user, db):
     rows = db.query(models.Holding).filter(models.Holding.user_id == user.id).all()
     out = []
     for h in rows:
-        price, indicator, reason = bridge.holding_indicator(h.ticker)
+        row = bridge.holding_row(h.ticker)
+        price = row["price"]
         pnl = round((price - h.avg_price) / h.avg_price * 100, 2) if (price and h.avg_price) else None
         out.append({
             "ticker": h.ticker, "shares": h.shares, "avg_price": round(h.avg_price, 2),
-            "current_price": price, "pnl_pct": pnl,
-            "indicator": indicator, "reason": reason,
+            "current_price": price, "pnl_pct": pnl, "change_pct": row["change_pct"],
+            "indicator": row["indicator"], "reason": row["reason"],
         })
     return {"holdings": out}
 
@@ -52,6 +53,8 @@ def buy(req: BuyRequest,
     else:
         db.add(models.Holding(user_id=current_user.id, ticker=ticker,
                               shares=req.shares, avg_price=price))
+    db.add(models.Transaction(user_id=current_user.id, ticker=ticker,
+                              action="BUY", shares=req.shares, price=price))
     db.commit()
     return _list_holdings(current_user, db)
 
@@ -68,9 +71,15 @@ def sell(req: SellRequest,
     if req.shares > h.shares:
         raise HTTPException(status_code=400,
                             detail=f"Only {h.shares} shares of {ticker} owned")
+    try:
+        sell_price = bridge.current_price(ticker)
+    except Exception:
+        sell_price = h.avg_price
     h.shares -= req.shares
     if h.shares <= 0:
         db.delete(h)
+    db.add(models.Transaction(user_id=current_user.id, ticker=ticker,
+                              action="SELL", shares=req.shares, price=sell_price))
     db.commit()
     return _list_holdings(current_user, db)
 
