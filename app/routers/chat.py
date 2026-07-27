@@ -1,7 +1,5 @@
-"""Chat route (protected): ask questions about YOUR portfolio.
-Context is built strictly from current_user, and the call is stateless —
-no cross-user mixing is possible."""
-from concurrent.futures import ThreadPoolExecutor
+"""Agentic chat (protected): Claude decides which tools to call, all user-scoped.
+No cross-user mixing — every handler queries by current_user.id."""
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
@@ -13,32 +11,52 @@ from app.schemas import ChatRequest, ChatResponse
 router = APIRouter(tags=["chat"])
 
 
+def _handlers(user, db):
+    """Build the tool handlers, each closed over the current user + db session."""
+
+    def get_stock_data(ticker):
+        return bridge.tool_stock_data(ticker)
+
+    def get_my_holdings():
+        rows = db.query(models.Holding).filter(models.Holding.user_id == user.id).all()
+        if not rows:
+            return {"holdings": [], "note": "user owns no stocks"}
+        return {"holdings": [
+            {"ticker": h.ticker, "shares": h.shares, "avg_price": round(h.avg_price, 2)}
+            for h in rows
+        ]}
+
+    def get_my_transactions(ticker=None):
+        q = db.query(models.Transaction).filter(models.Transaction.user_id == user.id)
+        if ticker:
+            q = q.filter(models.Transaction.ticker == ticker.upper().strip())
+        rows = q.order_by(models.Transaction.timestamp).all()
+        if not rows:
+            return {"transactions": [], "note": "no transactions found"}
+        return {"transactions": [
+            {"action": t.action, "ticker": t.ticker, "shares": t.shares,
+             "price": round(t.price, 2), "date": t.timestamp.strftime("%Y-%m-%d %H:%M")}
+            for t in rows
+        ]}
+
+    def get_my_watchlist():
+        rows = db.query(models.WatchlistItem).filter(
+            models.WatchlistItem.user_id == user.id).all()
+        return {"watchlist": [w.ticker for w in rows]}
+
+    return {
+        "get_stock_data": get_stock_data,
+        "get_my_holdings": get_my_holdings,
+        "get_my_transactions": get_my_transactions,
+        "get_my_watchlist": get_my_watchlist,
+    }
+
+
 @router.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest,
          current_user: models.User = Depends(get_current_user),
          db: Session = Depends(get_db)):
-    # Gather THIS user's holdings + live quote
-    rows = db.query(models.Holding).filter(models.Holding.user_id == current_user.id).all()
-    tickers = [h.ticker for h in rows]
-    quotes = {}
-    if tickers:
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            for q in pool.map(bridge.safe_quote, tickers):
-                quotes[q["ticker"]] = q
-
-    holdings_ctx = []
-    for h in rows:
-        q = quotes.get(h.ticker, {})
-        price = q.get("price")
-        pnl = round((price - h.avg_price) / h.avg_price * 100, 2) if (price and h.avg_price) else None
-        holdings_ctx.append({
-            "ticker": h.ticker, "shares": h.shares, "avg_price": round(h.avg_price, 2),
-            "price": price, "pnl_pct": pnl, "change_pct": q.get("change_pct"),
-        })
-
-    watchlist = [w.ticker for w in db.query(models.WatchlistItem)
-                 .filter(models.WatchlistItem.user_id == current_user.id).all()]
-
+    handlers = _handlers(current_user, db)
     history = [m.dict() for m in req.history]
-    answer = bridge.chat(req.message, history, holdings_ctx, watchlist)
+    answer = bridge.run_agentic_chat(req.message, history, handlers)
     return {"answer": answer}

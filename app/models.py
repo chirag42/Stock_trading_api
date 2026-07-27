@@ -48,3 +48,18 @@ class WatchlistItem(Base):
     __table_args__ = (UniqueConstraint("user_id", "ticker", name="uq_user_ticker"),)
 
     user = relationship("User", back_populates="watchlist")
+
+
+class Transaction(Base):
+    """Immutable log of every buy/sell — enables transaction-history questions."""
+    __tablename__ = "transactions"
+
+    id        = Column(Integer, primary_key=True)
+    user_id   = Column(Integer, ForeignKey("users.id"), nullable=False)
+    ticker    = Column(String, nullable=False)
+    action    = Column(String, nullable=False)   # "BUY" or "SELL"
+    shares    = Column(Float, nullable=False)
+    price     = Column(Float, nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User")

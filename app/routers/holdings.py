@@ -53,6 +53,8 @@ def buy(req: BuyRequest,
     else:
         db.add(models.Holding(user_id=current_user.id, ticker=ticker,
                               shares=req.shares, avg_price=price))
+    db.add(models.Transaction(user_id=current_user.id, ticker=ticker,
+                              action="BUY", shares=req.shares, price=price))
     db.commit()
     return _list_holdings(current_user, db)
 
@@ -69,9 +71,15 @@ def sell(req: SellRequest,
     if req.shares > h.shares:
         raise HTTPException(status_code=400,
                             detail=f"Only {h.shares} shares of {ticker} owned")
+    try:
+        sell_price = bridge.current_price(ticker)
+    except Exception:
+        sell_price = h.avg_price
     h.shares -= req.shares
     if h.shares <= 0:
         db.delete(h)
+    db.add(models.Transaction(user_id=current_user.id, ticker=ticker,
+                              action="SELL", shares=req.shares, price=sell_price))
     db.commit()
     return _list_holdings(current_user, db)
 
