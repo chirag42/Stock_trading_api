@@ -3,7 +3,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import CORS_ORIGINS, LLM_BACKEND, TICKERS
+from app.config import CORS_ORIGINS, RESEARCH_API_URL, TICKERS
 from app.database import init_db
 from app.routers import auth, market, watchlist, holdings, chat
 
@@ -24,7 +24,7 @@ def _startup():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "llm_backend": LLM_BACKEND, "universe": len(TICKERS)}
+    return {"status": "ok", "research_api": RESEARCH_API_URL, "universe": len(TICKERS)}
 
 
 app.include_router(auth.router)

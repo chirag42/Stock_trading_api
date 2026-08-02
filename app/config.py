@@ -1,17 +1,14 @@
 """
-config.py — Backend configuration (all overridable via environment variables).
-"""
+config.py — Backend (middleware) configuration. All overridable via env vars.
 
+The backend no longer imports the research code. It calls the Research API over
+HTTP; RESEARCH_API_URL points at that service.
+"""
 import os
 
-# Which LLM backend the analysis endpoint uses: "claude" or "ollama".
-LLM_BACKEND = os.getenv("LLM_BACKEND", "claude")
-
-# Absolute path to your existing trading system repo (the one with agents/,
-# services/, pipeline.py). The backend imports that code rather than duplicating it.
-# Set this to wherever your repo lives, e.g.:
-#   export TRADING_REPO_PATH="/Users/you/.../Stock_trading_Agentic_AI_Setup"
-TRADING_REPO_PATH = os.getenv("TRADING_REPO_PATH", "")
+# Base URL of the Research API (the decision engine). Start that service first:
+#   uvicorn api_server:app --port 8001   (in the research repo)
+RESEARCH_API_URL = os.getenv("RESEARCH_API_URL", "http://localhost:8001")
 
 # Fixed universe of 20 well-covered tickers for the opportunities list.
 TICKERS = [

@@ -1,49 +1,82 @@
 """
-bridge.py — the only file that talks to the existing trading system.
-Adds the trading repo to sys.path, builds heavy singletons once, and exposes
-small functions the routers call (market data, news, analysis, holdings analysis).
-"""
+Bridge — the middleware layer between the backend API and the Research API.
 
+The backend no longer imports the research code. Instead it calls the Research
+API over HTTP (RESEARCH_API_URL). This module owns the ORCHESTRATION: which
+research endpoints to call, and how to combine their results into the shapes the
+backend routers need. The research service stays the decision-maker; this file
+decides what to ask it.
+"""
 import json
 import logging
 import os
-import sys
 
-from app.config import LLM_BACKEND, TRADING_REPO_PATH
+import httpx
+
+from app.config import RESEARCH_API_URL
 
 logger = logging.getLogger("bridge")
 
-if TRADING_REPO_PATH and TRADING_REPO_PATH not in sys.path:
-    sys.path.insert(0, TRADING_REPO_PATH)
-
-import yfinance as yf
-from services.data_ingestion import DataIngestionService
-from services.sentiment_analysis import SentimentAnalysisService
-from services.sentiment_analysis.fetcher import NewsFetcher
-from agents.strategy_agent import StrategyAgent
-
-try:
-    from services.data_ingestion.fundamentals import (
-        FundamentalsFetcher, format_fundamentals_for_prompt
-    )
-    _HAS_FUNDAMENTALS = True
-except Exception:  # noqa: BLE001
-    _HAS_FUNDAMENTALS = False
-
-_data = DataIngestionService(cache_ttl=240)
-_sentiment = SentimentAnalysisService()
-_news = NewsFetcher()
-_agent = StrategyAgent(backend=LLM_BACKEND)
-_fundamentals = FundamentalsFetcher() if _HAS_FUNDAMENTALS else None
+_client = httpx.Client(base_url=RESEARCH_API_URL, timeout=30.0)
 
 
-def _fund_block(ticker: str):
-    if _fundamentals is None:
-        return None
+class ResearchUnavailable(Exception):
+    """Raised when the Research API cannot be reached or returns an error."""
+
+
+def _get(path: str, **params):
     try:
-        return format_fundamentals_for_prompt(_fundamentals.fetch(ticker))
-    except Exception:  # noqa: BLE001
-        return None
+        r = _client.get(path, params=params)
+    except httpx.HTTPError as exc:
+        raise ResearchUnavailable(f"Research API unreachable: {exc}") from exc
+    if r.status_code == 404:
+        raise ValueError(r.json().get("detail", "not found"))
+    if r.status_code >= 400:
+        raise ResearchUnavailable(f"Research API error {r.status_code}: {r.text}")
+    return r.json()
+
+
+def _post(path: str, payload: dict):
+    try:
+        r = _client.post(path, json=payload)
+    except httpx.HTTPError as exc:
+        raise ResearchUnavailable(f"Research API unreachable: {exc}") from exc
+    if r.status_code == 404:
+        raise ValueError(r.json().get("detail", "not found"))
+    if r.status_code >= 400:
+        raise ResearchUnavailable(f"Research API error {r.status_code}: {r.text}")
+    return r.json()
+
+
+# ── Quotes ────────────────────────────────────────────────────────
+def get_quote(ticker: str) -> dict:
+    """Current price + day change %. Raises ValueError if the ticker is invalid."""
+    return _get(f"/quote/{ticker}")
+
+
+def safe_quote(ticker: str) -> dict:
+    try:
+        return get_quote(ticker)
+    except Exception as exc:  # noqa: BLE001
+        return {"ticker": ticker, "price": None, "change_pct": None, "error": type(exc).__name__}
+
+
+def current_price(ticker: str) -> float:
+    return round(float(_get(f"/indicators/{ticker}")["close_price"]), 2)
+
+
+# ── Summary / indicators ──────────────────────────────────────────
+def get_summary(ticker: str) -> dict:
+    """Fast key stats for the stock header (indicators, no LLM)."""
+    m = _get(f"/indicators/{ticker}")
+    return {
+        "ticker": ticker,
+        "price": round(float(m["close_price"]), 2),
+        "rsi": round(float(m["rsi"]), 1),
+        "rsi_signal": m.get("rsi_signal", ""),
+        "macd": round(float(m["macd"]), 3),
+        "macd_signal": m.get("macd_signal", ""),
+    }
 
 
 # ── Opportunities (unbought → BUY / WAIT, fast, no LLM) ────────────
@@ -57,7 +90,7 @@ def _opportunity_indicator(rsi, macd, signal):
 
 def classify_opportunity(ticker: str) -> dict:
     try:
-        m = _data.get_latest_summary(ticker)
+        m = _get(f"/indicators/{ticker}")
         indicator, reason = _opportunity_indicator(m["rsi"], m["macd"], m["signal"])
         return {"ticker": ticker, "price": round(float(m["close_price"]), 2),
                 "rsi": round(float(m["rsi"]), 1), "indicator": indicator, "reason": reason}
@@ -67,42 +100,35 @@ def classify_opportunity(ticker: str) -> dict:
                 "reason": "Data unavailable.", "error": type(exc).__name__}
 
 
-# ── Chart / news / analysis (unbought detail) ─────────────────────
+# ── Chart / news / analysis ───────────────────────────────────────
 def get_chart(ticker: str, period: str = "3mo") -> list:
-    df = yf.Ticker(ticker).history(period=period)
-    if df is None or df.empty:
+    try:
+        return _get(f"/chart/{ticker}", period=period).get("points", [])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"chart failed for {ticker}: {exc}")
         return []
-    return [{"date": idx.strftime("%Y-%m-%d"), "close": round(float(row), 2)}
-            for idx, row in df["Close"].items()]
 
 
 def get_news(ticker: str, count: int = 8) -> list:
     try:
-        articles = _news.fetch(ticker, count)
+        return _get(f"/news/{ticker}", count=count).get("articles", [])
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"news failed for {ticker}: {exc}")
         return []
-    return [{"title": a.get("title", ""), "description": a.get("description", ""),
-             "url": a.get("url", "")} for a in articles]
 
 
 def get_analysis(ticker: str) -> dict:
-    market = _data.get_latest_summary(ticker)
-    sentiment = _sentiment.get_aggregated_sentiment(ticker)
-    result = _agent.decide(market, sentiment, _fund_block(ticker))
-    return {"ticker": ticker, "decision": result["decision"],
-            "reasoning": result["llm_reasoning"], "backend": LLM_BACKEND}
+    """Full opportunity decision (BUY/SELL/HOLD + reasoning) — delegated to research."""
+    d = _post("/decision", {"ticker": ticker})
+    return {"ticker": ticker, "decision": d["decision"],
+            "reasoning": d["reasoning"], "backend": d.get("backend", "research")}
 
 
 # ── Holdings (owned → SELL / HOLD, position-aware) ────────────────
-def current_price(ticker: str) -> float:
-    return round(float(_data.get_latest_summary(ticker)["close_price"]), 2)
-
-
 def holding_indicator(ticker: str):
     """Fast, no-LLM exit indicator for the holdings list: SELL or HOLD."""
     try:
-        m = _data.get_latest_summary(ticker)
+        m = _get(f"/indicators/{ticker}")
         price = round(float(m["close_price"]), 2)
         if m["rsi"] > 65 and m["macd"] < m["signal"]:
             return price, "SELL", "Overbought with bearish MACD — consider taking profit."
@@ -111,133 +137,28 @@ def holding_indicator(ticker: str):
         return None, "HOLD", f"Data unavailable ({type(exc).__name__})."
 
 
-def _parse_sell_hold(text: str) -> str:
-    first = text.strip().split()[0].upper().strip(".,!?") if text.strip() else ""
-    if first in {"SELL", "HOLD"}:
-        return first
-    for w in text.upper().split():
-        if w.strip(".,!?") in {"SELL", "HOLD"}:
-            return w.strip(".,!?")
-    return "HOLD"
-
-
-def analyze_holding(ticker: str, shares: float, avg_price: float) -> dict:
-    """Full position-aware LLM analysis for an owned stock (SELL or HOLD only)."""
-    m = _data.get_latest_summary(ticker)
-    price = round(float(m["close_price"]), 2)
-    pnl = ((price - avg_price) / avg_price * 100) if avg_price else 0.0
-    sentiment = _sentiment.get_aggregated_sentiment(ticker)
-    fund = _fund_block(ticker)
-
-    prompt = "\n".join([
-        "You are a portfolio advisor. The user ALREADY OWNS this position.",
-        f"POSITION: {shares} shares of {ticker}, bought at ${avg_price}, "
-        f"now ${price} ({pnl:+.1f}% profit/loss).",
-        "",
-        "TECHNICAL INDICATORS",
-        f"RSI: {m['rsi']}   MACD: {m['macd']} vs Signal {m['signal']}",
-        "",
-        "MARKET SENTIMENT",
-        f"Overall: {sentiment['overall'].upper()} "
-        f"({sentiment['positive']}+/{sentiment['negative']}- of {sentiment['articles_analyzed']})",
-        "",
-        (fund or "FUNDAMENTALS\n(unavailable)"),
-        "",
-        "DECISION RULES",
-        "- Recommend SELL to exit the position if indicators, sentiment, or risk suggest it.",
-        "- Recommend HOLD to keep the position otherwise.",
-        "- Only SELL or HOLD — the user already owns this; BUY is not an option.",
-        "",
-        "YOUR TASK",
-        "1. First line must be exactly one word: SELL or HOLD",
-        "2. Give 2-3 short reasons (mention the profit/loss where relevant)",
-        "3. Mention one key risk",
-    ])
-    resp = _agent.llm_client.query(prompt)
-    return {"ticker": ticker, "decision": _parse_sell_hold(resp), "reasoning": resp,
-            "pnl_pct": round(pnl, 2), "current_price": price, "backend": LLM_BACKEND}
-
-
-def get_summary(ticker: str) -> dict:
-    """Fast key stats for the stock header (no LLM, no news fetch)."""
-    m = _data.get_latest_summary(ticker)
-    return {
-        "ticker": ticker,
-        "price": round(float(m["close_price"]), 2),
-        "rsi": round(float(m["rsi"]), 1),
-        "rsi_signal": m.get("rsi_signal", ""),
-        "macd": round(float(m["macd"]), 3),
-        "macd_signal": m.get("macd_signal", ""),
-    }
-
-
-def get_quote(ticker: str) -> dict:
-    """Current price + day change % (one yfinance call). Raises if invalid."""
-    h = yf.Ticker(ticker).history(period="2d")
-    if h is None or h.empty:
-        raise ValueError(f"No data for {ticker}")
-    closes = [float(x) for x in h["Close"].tolist() if x == x]
-    if not closes:
-        raise ValueError(f"No data for {ticker}")
-    price = round(closes[-1], 2)
-    prev = closes[-2] if len(closes) >= 2 else price
-    change_pct = round((price - prev) / prev * 100, 2) if prev else 0.0
-    return {"ticker": ticker, "price": price, "change_pct": change_pct}
-
-
-def safe_quote(ticker: str) -> dict:
-    try:
-        return get_quote(ticker)
-    except Exception as exc:  # noqa: BLE001
-        return {"ticker": ticker, "price": None, "change_pct": None, "error": type(exc).__name__}
-
-
 def holding_row(ticker: str) -> dict:
     """Price, today's change %, and SELL/HOLD indicator for a held stock."""
     q = safe_quote(ticker)
     try:
-        m = _data.get_latest_summary(ticker)
+        m = _get(f"/indicators/{ticker}")
         if m["rsi"] > 65 and m["macd"] < m["signal"]:
             indicator, reason = "SELL", "Overbought with bearish MACD — consider taking profit."
         else:
             indicator, reason = "HOLD", "No exit signal — position looks fine."
-    except Exception:
+    except Exception:  # noqa: BLE001
         indicator, reason = "HOLD", "Data unavailable."
     return {"price": q.get("price"), "change_pct": q.get("change_pct"),
             "indicator": indicator, "reason": reason}
 
 
-def chat(message: str, history: list, holdings_ctx: list, watchlist: list) -> str:
-    """Answer a user's free-form question grounded in THEIR portfolio data.
-    Stateless: all context is passed in per call, so users never mix."""
-    if holdings_ctx:
-        hold_lines = "\n".join(
-            f"- {h['ticker']}: {h['shares']} shares, bought at ${h['avg_price']}, "
-            f"now ${h.get('price','?')} ({h.get('pnl_pct','?')}% P/L, {h.get('change_pct','?')}% today)"
-            for h in holdings_ctx
-        )
-    else:
-        hold_lines = "(the user owns no stocks yet)"
-
-    wl = ", ".join(watchlist) if watchlist else "(empty)"
-
-    convo = ""
-    for turn in history[-10:]:  # cap history to control token size
-        role = "User" if turn.get("role") == "user" else "Assistant"
-        convo += f"{role}: {turn.get('content','')}\n"
-
-    prompt = (
-        "You are a helpful assistant inside a stock-trading simulation app.\n"
-        "Use ONLY the portfolio data provided below. Do not invent prices or figures. "
-        "If asked about something not in the data, say you don't have that information. "
-        "Keep answers concise and practical. This is a simulation, not financial advice.\n\n"
-        f"USER'S HOLDINGS:\n{hold_lines}\n\n"
-        f"USER'S WATCHLIST: {wl}\n\n"
-        f"{'CONVERSATION SO FAR:\n' + convo + '\n' if convo else ''}"
-        f"User: {message}\n"
-        "Assistant:"
-    )
-    return _agent.llm_client.query(prompt)
+def analyze_holding(ticker: str, shares: float, avg_price: float) -> dict:
+    """Position-aware SELL/HOLD analysis — delegated to research with position context."""
+    d = _post("/decision", {"ticker": ticker,
+                            "position": {"shares": shares, "avg_price": avg_price}})
+    return {"ticker": ticker, "decision": d["decision"], "reasoning": d["reasoning"],
+            "pnl_pct": d.get("pnl_pct"), "current_price": d.get("current_price"),
+            "backend": d.get("backend", "research")}
 
 
 # ── Agentic chat: tool definitions + tool-use loop ────────────────
@@ -293,31 +214,30 @@ CHAT_SYSTEM = (
     "- Use short bullet points for lists of facts.\n"
     "- Bold the key number or decision.\n"
     "- Keep it concise — no long paragraphs."
-    
 )
 
 
 def tool_stock_data(ticker: str) -> dict:
-    """Tool body for get_stock_data — validates and fetches live context for any ticker."""
+    """Tool body for get_stock_data — combines research atomic endpoints for any ticker."""
     ticker = (ticker or "").upper().strip()
     if not ticker:
         return {"error": "no ticker provided"}
     try:
-        q = get_quote(ticker)  # raises if invalid
-    except Exception:
+        q = get_quote(ticker)  # validates
+    except Exception:  # noqa: BLE001
         return {"error": f"'{ticker}' is not a valid ticker or has no market data."}
     out = {"ticker": ticker, "price": q["price"], "day_change_pct": q["change_pct"]}
     try:
-        m = _data.get_latest_summary(ticker)
+        m = _get(f"/indicators/{ticker}")
         out.update({"rsi": round(float(m["rsi"]), 1), "rsi_signal": m.get("rsi_signal", ""),
                     "macd": round(float(m["macd"]), 3), "macd_signal": m.get("macd_signal", "")})
-    except Exception:
+    except Exception:  # noqa: BLE001
         out["indicators"] = "unavailable"
     try:
-        s = _sentiment.get_aggregated_sentiment(ticker)
+        s = _get(f"/sentiment/{ticker}")
         out.update({"sentiment": s["overall"], "positive_articles": s["positive"],
                     "negative_articles": s["negative"]})
-    except Exception:
+    except Exception:  # noqa: BLE001
         out["sentiment"] = "unavailable"
     return out
 
@@ -349,7 +269,6 @@ def run_agentic_chat(message: str, history: list, handlers: dict, max_iters: int
                                     "content": json.dumps(data)})
             messages.append({"role": "user", "content": results})
             continue
-        # Final answer
         return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
 
     return "I could not complete that request in time — please try rephrasing."
